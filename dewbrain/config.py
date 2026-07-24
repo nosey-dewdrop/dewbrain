@@ -52,6 +52,12 @@ def _env_float(name: str, default: float) -> float:
 @dataclass(frozen=True)
 class APIConfig:
     """Anthropic API surface — model + robustness policy."""
+    # engine = which text-generation backend the vmPFC calls.
+    #   "api" -> anthropic API (metered, autonomous, runs headless without a session)
+    #   "max" -> Claude Code session (Max subscription, zero extra cost, needs a live session)
+    # The core (retrieval/law/loop) is engine-agnostic; only this pluggable part changes.
+    # A future "local" (own fine-tuned model, GPU) slots into the same interface.
+    engine: str = field(default_factory=lambda: _env_str("DEWBRAIN_ENGINE", "api"))
     model: str = field(default_factory=lambda: _env_str("DEWBRAIN_MODEL", "claude-opus-4-8"))
     # max_tokens: generate/repair produce a full post; give room, stream to dodge HTTP timeout.
     max_tokens: int = field(default_factory=lambda: _env_int("DEWBRAIN_MAX_TOKENS", 8000))

@@ -20,109 +20,25 @@ Config (model/k/beta/max-iter/retry) lives in config.py, never embedded here.
 from __future__ import annotations
 
 import json
-import os
-import random
-import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
-
-import anthropic
+from typing import Any
 
 from config import Config, load_config
 from law import YASA_METNI, RUBRIK, WEIGHTS
 from corpus import load_gold
 from retrieval import HippocampalRetrieval
+from engine import build_engine, Engine, EngineError
+
+# Backward-compat alias so old references keep working. The robust API/session backends
+# now live in engine.py; brain.py is engine-agnostic and only calls engine.complete().
+DewbrainAPIError = EngineError
 
 
 # --------------------------------------------------------------------------------------
-# API layer — robust Claude calls (retry, rate-limit, timeout, streaming, adaptive thinking)
+# The robust API / session backends live in engine.py. brain.py is engine-agnostic:
+# it builds prompts and calls engine.complete(prompt). Swap api<->max<->local via config.
 # --------------------------------------------------------------------------------------
-
-class DewbrainAPIError(RuntimeError):
-    """Raised when a Claude call cannot be completed after all retries."""
-
-
-def build_client(cfg: Config) -> anthropic.Anthropic:
-    """Resolve the API key and construct a client. Fail loud and early if the key is missing."""
-    key = os.environ.get("ANTHROPIC_API_KEY")
-    if not key:
-        raise DewbrainAPIError(
-            "ANTHROPIC_API_KEY not set. In the Claude Code session:\n"
-            "  export ANTHROPIC_API_KEY=...\n"
-        )
-    # The SDK also retries 429/5xx internally; we set max_retries=0 here so OUR loop owns
-    # backoff (single retry policy, observable). timeout is the per-request ceiling.
-    return anthropic.Anthropic(api_key=key, timeout=cfg.api.timeout, max_retries=0)
-
-
-def _sleep_backoff(attempt: int, cfg: Config, retry_after: float | None = None) -> float:
-    """Exponential backoff with full jitter; honor a server-sent retry-after when present."""
-    if retry_after is not None:
-        delay = min(retry_after, cfg.api.max_delay)
-    else:
-        delay = min(cfg.api.base_delay * (2 ** attempt), cfg.api.max_delay)
-        delay = random.uniform(0, delay)  # full jitter: avoids thundering-herd on retries
-    time.sleep(delay)
-    return delay
-
-
-def _stream_text(client: anthropic.Anthropic, cfg: Config, prompt: str,
-                 log: Callable[[str], None]) -> str:
-    """
-    One robust Claude turn. Streams (so long generate/repair outputs never hit the HTTP
-    idle timeout), retries rate-limit / 5xx / connection / timeout with backoff, and returns
-    the concatenated text of the final message.
-    """
-    # max_retries = number of RETRIES, so total attempts = max_retries + 1 (fixes off-by-one).
-    last_exc: Exception | None = None
-    for attempt in range(cfg.api.max_retries + 1):
-        try:
-            with client.messages.stream(
-                model=cfg.api.model,
-                max_tokens=cfg.api.max_tokens,
-                thinking={"type": "adaptive"},            # only on-mode for opus-4-8
-                output_config={"effort": cfg.api.effort},  # depth/cost knob
-                messages=[{"role": "user", "content": prompt}],
-            ) as stream:
-                # Drain the stream so the connection stays warm, then take the final message.
-                for _ in stream.text_stream:
-                    pass
-                msg = stream.get_final_message()
-
-            if msg.stop_reason == "refusal":
-                # Safety refusal is terminal for this call — retrying the same prompt won't help.
-                detail = getattr(msg, "stop_details", None)
-                cat = getattr(detail, "category", None) if detail else None
-                raise DewbrainAPIError(f"Claude refused (category={cat}). Prompt not retried.")
-
-            text = "".join(b.text for b in msg.content if getattr(b, "type", None) == "text")
-            if not text.strip():
-                raise DewbrainAPIError(f"Empty response (stop_reason={msg.stop_reason}).")
-            return text.strip()
-
-        except anthropic.RateLimitError as e:
-            last_exc = e
-            ra = None
-            try:
-                ra = float(e.response.headers.get("retry-after", "")) if e.response else None
-            except (ValueError, AttributeError):
-                ra = None
-            waited = _sleep_backoff(attempt, cfg, retry_after=ra)
-            log(f"  [api] rate limited, retry {attempt + 1}/{cfg.api.max_retries} in {waited:.1f}s")
-        except (anthropic.APIStatusError, anthropic.APIConnectionError, anthropic.APITimeoutError) as e:
-            # 5xx / network / timeout are retryable; a 4xx client error is not.
-            status = getattr(e, "status_code", None)
-            if isinstance(e, anthropic.APIStatusError) and status is not None and status < 500:
-                raise DewbrainAPIError(f"Non-retryable API error {status}: {e}") from e
-            last_exc = e
-            waited = _sleep_backoff(attempt, cfg)
-            log(f"  [api] {type(e).__name__}, retry {attempt + 1}/{cfg.api.max_retries} in {waited:.1f}s")
-
-    raise DewbrainAPIError(
-        f"Claude call failed after {cfg.api.max_retries} retries: {last_exc}"
-    ) from last_exc
-
 
 def _parse_verdict_json(raw: str) -> dict[str, Any]:
     """
@@ -157,7 +73,7 @@ def _few_shot(gold_hits: list[dict]) -> str:
     )
 
 
-def generate(cue: str, gold_hits: list[dict], client, cfg, log) -> str:
+def generate(cue: str, gold_hits: list[dict], engine: Engine, log) -> str:
     """neocortex + vmPFC: produce a full post from the cue, conditioned on law + retrieved gold."""
     prompt = f"""{YASA_METNI}
 
@@ -172,10 +88,10 @@ Ham fikir:
 {cue}
 
 Sadece yazının kendisini ver, başka açıklama yok."""
-    return _stream_text(client, cfg, prompt, log)
+    return engine.complete(prompt, log)
 
 
-def critique(draft: str, gold_hits: list[dict], client, cfg, log) -> dict[str, Any]:
+def critique(draft: str, gold_hits: list[dict], engine: Engine, log) -> dict[str, Any]:
     """prefrontal: adversarial self-critique against the law. Every rubric item is binary a_k.
 
     K2 fix (cs-mapping (e), few-shot style): the judge sees Damla's approved voice as a
@@ -201,14 +117,14 @@ SADECE JSON döndür, başka hiçbir şey:
 
 Maddeler:
 {items}"""
-    raw = _stream_text(client, cfg, prompt, log)
+    raw = engine.complete(prompt, log)
     verdict = _parse_verdict_json(raw)
     if "items" not in verdict or not isinstance(verdict["items"], list):
         raise DewbrainAPIError(f"Critique JSON missing 'items' list:\n{raw[:300]}")
     return verdict
 
 
-def repair(draft: str, verdict: dict, gold_hits: list[dict], client, cfg, log) -> str:
+def repair(draft: str, verdict: dict, gold_hits: list[dict], engine: Engine, log) -> str:
     """prefrontal repair: rewrite targeting ONLY the failed items, leaving the rest intact."""
     fails = [i for i in verdict["items"] if not i.get("pass", False)]
     if not fails:
@@ -227,7 +143,7 @@ Yazı:
 {draft}
 
 Düzeltilmiş yazıyı ver, sadece metin."""
-    return _stream_text(client, cfg, prompt, log)
+    return engine.complete(prompt, log)
 
 
 # --------------------------------------------------------------------------------------
@@ -278,7 +194,8 @@ def run(cue: str, cfg: Config | None = None, verbose: bool = True) -> dict[str, 
     cfg = cfg or load_config()
     log = (lambda m: print(m)) if verbose else (lambda m: None)
 
-    client = build_client(cfg)
+    engine = build_engine(cfg)
+    log(f"[engine] backend={cfg.api.engine} model={cfg.api.model}")
 
     # hippocampus: recall the most separable gold traces (Hopfield/attention, not cosine-top-k).
     gold = load_gold()
@@ -299,7 +216,7 @@ def run(cue: str, cfg: Config | None = None, verbose: bool = True) -> dict[str, 
 
     # neocortex + vmPFC: first draft.
     log("[neocortex+vmPFC] generating first draft...")
-    draft = generate(cue, hits, client, cfg, log)
+    draft = generate(cue, hits, engine, log)
 
     # prefrontal: loop-until-clean. Re-critique after every repair; keep the best draft by
     # WEIGHTED violation (RUBRIC-ARROW), not raw count — a single em-dash beats two light fails.
@@ -313,7 +230,7 @@ def run(cue: str, cfg: Config | None = None, verbose: bool = True) -> dict[str, 
     for i in range(cfg.loop.max_iter):
         iterations = i + 1
         log(f"[prefrontal] critique pass {iterations}/{cfg.loop.max_iter}...")
-        verdict = critique(current, hits, client, cfg, log)
+        verdict = critique(current, hits, engine, log)
         fails = _fail_count(verdict)
         wfail = _weighted_fail(verdict)
         log(f"  violations={fails} weighted={wfail:.1f} damla_kokuyor={verdict.get('damla_kokuyor')}")
@@ -329,7 +246,7 @@ def run(cue: str, cfg: Config | None = None, verbose: bool = True) -> dict[str, 
             break
 
         log(f"[prefrontal] repairing {fails} violation(s) (weighted {wfail:.1f})...")
-        current = repair(current, verdict, hits, client, cfg, log)
+        current = repair(current, verdict, hits, engine, log)
 
     accepted = best_fails == 0
     result = {
