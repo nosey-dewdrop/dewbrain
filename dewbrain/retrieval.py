@@ -144,9 +144,17 @@ class HippocampalRetrieval:
         self.salience_w = salience_w
         self.diversity = diversity  # 1.0 = pure MMR diversity, 0.0 = pure relevance
         self.model = SentenceTransformer(model_name)
+        self._model_name = model_name
 
+        # content-addressed cache: only unseen bodies are embedded, the rest hit
+        # disk. Turns the ~30s corpus encode into ~0s on repeat runs (autonomous
+        # loop). Falls back to a direct encode if the cache module is unavailable.
         texts = [e["body"] for e in entries]
-        emb = self.model.encode(texts, normalize_embeddings=True)
+        try:
+            from embed_cache import encode_cached
+            emb = encode_cached(texts, model_name=model_name, normalize=True)
+        except Exception:
+            emb = self.model.encode(texts, normalize_embeddings=True)
         self.emb = torch.as_tensor(np.asarray(emb, dtype=np.float32))  # (N, d)
 
         # recency + salience priors, normalized to [0,1] once at build time.
