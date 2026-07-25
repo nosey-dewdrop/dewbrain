@@ -40,14 +40,15 @@ Amaç: bugünkü çekirdeğin zayıf yerlerini kapat. Her biri bağımsız, pay-
    DENEY BULGUSU (25 Tem): embedding gücü çözmedi (e5 mpnet'ten kötü), VERİ sorunu.
    Çözüm: farklı alanlardan karar (iş, içerik, strateji) topla → manifold ayrışır.
    *(gerek: çeşitli karar verisi — DECISIONS.md'leri zenginleştir)*
-3. ⬜ **salience prior gerçek** — şu an gold-adaylarda sabit 0.50. Metnin gerçek
-   substance/poignancy'sini ölç (uzunluk+ders yoğunluğu+duygu). *(veri gerekmez)*
-4. ⬜ **kanal-dengeleme** — report 732 sayıca writing 237'yi eziyor; retrieval'da
-   audit dili sesi bastırabilir. Kanal-dengeli örnekleme. *(veri gerekmez)*
-5. ⬜ **retrieval cache** — her run 1400 iz embed ediyor (~30sn). Bir kez kur,
-   diske cache'le. *(veri gerekmez, sadece hız)*
-6. ⬜ **sınır filtresi kodda** — hassas veri (anne/para/hasta) çıktıya asla
-   girmesin diye retrieval-sonrası filtre. Şu an yasa var, kod yok. *(veri gerekmez)*
+3. ✅ **salience prior gerçek** — sabit 0.50 kalktı. `_substance_prior` verdict'siz
+   metnin gücünü ölçer (tez/karşıtlık/sayı/insani-mühür). Adaylar 0.57-0.77 dağılıyor.
+4. ✅ **kanal-dengeleme** — channel_weight retrieval'a girdi (prior). report 732
+   sayı baskınlığı ağırlıkla dengelendi; karar-cue'da decision izleri artık geliyor.
+5. ✅ **retrieval cache** — içerik-adresli embedding cache. 1400 iz: 41s → 4.9s
+   (~8×). data/ altında (gitignore). tüm katmanlar paylaşır.
+6. ✅ **sınır filtresi kodda** — `boundary.py`, beyin-bilir-söylemez. 2 katman:
+   trace-tagging (recall et, quote etme) + output-screen (yapısal+semantik, parafraz
+   yakalar, fail-closed). brain.py'ye bağlı.
 
 **Kill-gate:** world-model alan-dışını güvenilir ayırıyor mu? Ayırana kadar
 "karar veren" iddiası yapılmaz (over-claim = Damla'nın nefreti).
