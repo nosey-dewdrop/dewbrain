@@ -31,6 +31,10 @@ from retrieval import HippocampalRetrieval
 from engine import build_engine, Engine, EngineError
 from metacognition import assess as mc_assess, confidence_line
 from router import route
+from boundary import OutputScreen
+
+# Output boundary screen, built once (loads its model lazily on first screen()).
+_SCREEN = OutputScreen()
 
 # Backward-compat alias so old references keep working. The robust API/session backends
 # now live in engine.py; brain.py is engine-agnostic and only calls engine.complete().
@@ -69,9 +73,13 @@ def _parse_verdict_json(raw: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------------------
 
 def _few_shot(gold_hits: list[dict]) -> str:
-    """Retrieved gold -> few-shot example block (neocortex semantic reference)."""
+    """Retrieved gold -> few-shot example block (neocortex semantic reference).
+    Layer-1 boundary: a sensitive trace may be RECALLED for grounding but is
+    never copied verbatim into the voice block (know, don't quote)."""
+    from boundary import is_trace_sensitive
+    safe = [g for g in gold_hits if not is_trace_sensitive(g)]
     return "\n\n".join(
-        f"--- EXAMPLE (Damla's approved voice) ---\n{g['body']}" for g in gold_hits
+        f"--- EXAMPLE (Damla's approved voice) ---\n{g['body']}" for g in safe
     )
 
 
@@ -118,8 +126,11 @@ def _context_block(context_hits: list[dict]) -> str:
     in real past instead of inventing (the law's 'no fabricated live feature')."""
     if not context_hits:
         return ""
+    from boundary import is_trace_sensitive
     blocks = []
     for h in context_hits:
+        if is_trace_sensitive(h):
+            continue  # recalled for grounding, but not quoted into the prompt
         ch = h.get("channel", "")
         blocks.append(f"[{ch}] {h['title']}\n{h['body']}")
     joined = "\n\n".join(blocks)
@@ -341,18 +352,39 @@ def run(cue: str, cfg: Config | None = None, verbose: bool = True) -> dict[str, 
     )
     log(f"[metacognition] {confidence_line(conf)}")
 
+    # boundary: the brain KNOWS everything but must not SAY sensitive data
+    # (CLAUDE.md law "beyin bilir, söylemez"). Screen the final before release;
+    # a flagged span holds/redacts the output. Fail-closed (screener error = hold).
+    released = best_draft
+    boundary_held = False
+    try:
+        bverdict = _SCREEN.screen(best_draft, redact=True)
+        if not bverdict.safe:
+            boundary_held = True
+            released = bverdict.redacted_text
+            log(f"[boundary] TUTULDU — hassas içerik ({'; '.join(bverdict.reasons[:2])}). "
+                f"redakte edildi.")
+        else:
+            log("[boundary] temiz — söylenmesi güvenli.")
+    except Exception as e:
+        boundary_held = True
+        released = "[sınır doğrulanamadı, tutuldu]"
+        log(f"[boundary] tarayıcı hatası, fail-closed: {e}")
+
     result = {
         "cue": cue,
         "gold_used": [h["title"] for h in hits],
         "context_used": [h["title"] for h in context_hits],
-        "final": best_draft,
+        "final": released,
+        "final_raw": best_draft,   # unscreened draft (audit; never auto-published)
         "verdict": best_verdict,
         "ihlal_sayisi": best_fails,
         "weighted_fail": best_weight,
         "iterations": iterations,
-        "accepted": accepted,
+        "accepted": accepted and not boundary_held,
         "confidence": conf.as_dict(),
         "abstained": conf.abstains,
+        "boundary_held": boundary_held,
     }
 
     hist = persist_run(result, cfg)
