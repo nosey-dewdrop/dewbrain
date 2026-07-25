@@ -130,13 +130,15 @@ class HippocampalRetrieval:
                  alpha: float = 1.5, beta: float | None = None,
                  target_ratio: float = 6.0,
                  recency_w: float = 0.10, salience_w: float = 0.10,
-                 diversity: float = 0.5):
+                 channel_w: float = 0.10, diversity: float = 0.5):
         from sentence_transformers import SentenceTransformer
 
         if not entries:
             raise ValueError("retrieval needs at least one stored pattern")
 
         self.entries = entries
+        self.channel_w = channel_w  # channel-balance prior (report 732 must not
+        # drown decision 45 by sheer COUNT; per-trace channel weight offsets it).
         self.alpha = alpha  # 1.5 = 1.5-entmax; ->1 recovers dense softmax
         # research c: score = relevance + recency + importance. Weights small so
         # relevance still dominates; they only break ties in a homogeneous corpus.
@@ -157,9 +159,10 @@ class HippocampalRetrieval:
             emb = self.model.encode(texts, normalize_embeddings=True)
         self.emb = torch.as_tensor(np.asarray(emb, dtype=np.float32))  # (N, d)
 
-        # recency + salience priors, normalized to [0,1] once at build time.
+        # recency + salience + channel priors, normalized to [0,1] once at build.
         self._recency = self._recency_prior(entries)
         self._salience = self._salience_prior(entries)
+        self._channel = self._channel_prior(entries)
 
         # corpus self-similarity (cosine, since normalized) drives calibration.
         self._sim = (self.emb @ self.emb.T).numpy()
@@ -200,6 +203,20 @@ class HippocampalRetrieval:
         out = np.where(s > 0.0, s / 10.0, 0.5).astype(np.float32)
         return out
 
+    @staticmethod
+    def _channel_prior(entries) -> np.ndarray:
+        """channel_weight -> [0,1]. Offsets count imbalance: a report channel
+        (732 traces, w=0.9) must not outweigh a decision channel (45, w=1.4) just
+        by having more traces. The per-trace weight nudges the score so a decision
+        can win over a report even though reports are far more numerous. Missing
+        weight -> neutral 1.0 (no offset)."""
+        w = np.array([float(e.get("channel_weight", 1.0) or 1.0) for e in entries],
+                     dtype=np.float32)
+        lo, hi = float(w.min()), float(w.max())
+        if hi - lo < 1e-6:
+            return np.full(len(entries), 0.5, dtype=np.float32)
+        return ((w - lo) / (hi - lo)).astype(np.float32)
+
     # -- core recall --------------------------------------------------------
     def recall(self, cue: str, k: int = 3, min_weight: float = 1e-3):
         """cue -> k complementary gold traces (relevance + recency + salience, MMR-diverse).
@@ -223,7 +240,8 @@ class HippocampalRetrieval:
         # relevance; small priors break ties in a homogeneous corpus.
         base = (w_np
                 + self.recency_w * self._recency
-                + self.salience_w * self._salience)
+                + self.salience_w * self._salience
+                + self.channel_w * self._channel)
 
         picked = self._mmr_select(base, k=k, min_weight=min_weight)
         hits = []
