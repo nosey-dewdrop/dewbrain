@@ -260,17 +260,69 @@ def load_raw() -> list[dict]:
 # ---------------------------------------------------------------------------
 # consolidation bridge: approved output -> grown gold  (research c)
 # ---------------------------------------------------------------------------
+def _substance_prior(body: str) -> float:
+    """Poignancy WITHOUT a law verdict (research c, generative agents). The old
+    code returned a flat 5.0 when no verdict existed, so every gold candidate
+    scored identical 0.50 — salience did no ranking at all. This measures how
+    'strong/memorable' a text is from deterministic signals that track Damla's
+    own voice law: a carried THESIS, binary CONTRAST, concrete NUMBERS (her law:
+    'sayı = güç'), and a HUMAN mark. Returns 1..10, no model, no GPU.
+    """
+    text = (body or "").strip()
+    if not text:
+        return 1.0
+    words = text.split()
+    n = len(words)
+    low = text.lower()
+
+    score = 3.0  # neutral floor for a real-but-plain trace
+
+    # length band: too short can't teach voice; a full post is substantive.
+    if n >= 40:
+        score += 1.0
+    if n >= 120:
+        score += 1.0
+    if n < 20:
+        score -= 1.5
+
+    # concrete numbers / measurements = evidence (Damla: numbers are the hook).
+    import re as _re
+    n_numbers = len(_re.findall(r"\b\d[\d.,]*\b", text))
+    if n_numbers >= 1:
+        score += 0.7
+    if n_numbers >= 3:
+        score += 0.6
+
+    # binary contrast — her sharpening blade ("not X but Y", "değil ... ama").
+    contrast = ("not because", "but because", "instead of", " not a ", " not the ",
+                "değil", " ama ", "yerine", " vs ", "rather than")
+    if any(c in low for c in contrast):
+        score += 0.8
+
+    # human mark / stance — the lines that make it hers, not a report.
+    human = ("i just love", "i wish", "the truth is", "i stopped", "i kept",
+             "ben ", "kendi", "bu yüzden", "aslında")
+    if any(h in low for h in human):
+        score += 0.6
+
+    # a single-clause one-liner rarely carries a full thesis.
+    if text.count(".") + text.count("\n") <= 1 and n < 30:
+        score -= 1.0
+
+    return max(1.0, min(10.0, score))
+
+
 def salience(entry_body: str, verdict: Optional[dict] = None,
              human_approved: bool = False) -> float:
     """
     Poignancy 1-10 (research c, generative agents). Cheap, deterministic,
     parameter-free (no GPU). Combines:
-      - law pass rate (a clean pass is a strong keep signal)
+      - law pass rate (a clean pass is a strong keep signal), when a verdict exists
+      - a SUBSTANCE prior from the text itself when there is no verdict (so gold
+        candidates actually RANK instead of all scoring a flat 5.0)
       - explicit human approval (Damla said "this is me") = ceiling
-      - a modest length/substance prior (one-liners are weak gold)
     Salience gates what is worth consolidating into semantic gold.
     """
-    score = 5.0
     if verdict and verdict.get("items"):
         items = verdict["items"]
         passed = sum(1 for i in items if i.get("pass"))
@@ -282,6 +334,11 @@ def salience(entry_body: str, verdict: Optional[dict] = None,
         # ranking, it does not certify identity.
         if verdict.get("damla_kokuyor") is True:
             score = min(9.0, score + 0.5)  # nudge, capped below the human ceiling
+    else:
+        # no verdict (e.g. ranking existing raw traces as gold candidates):
+        # score from the text's own substance instead of a flat constant.
+        score = _substance_prior(entry_body)
+
     words = len(entry_body.split())
     if words < 40:              # too thin to teach voice
         score -= 2.0
