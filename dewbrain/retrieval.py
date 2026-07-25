@@ -130,13 +130,29 @@ class HippocampalRetrieval:
                  alpha: float = 1.5, beta: float | None = None,
                  target_ratio: float = 6.0,
                  recency_w: float = 0.10, salience_w: float = 0.10,
-                 channel_w: float = 0.10, diversity: float = 0.5):
+                 channel_w: float = 0.10, diversity: float = 0.5,
+                 identity: str | None = "default"):
         from sentence_transformers import SentenceTransformer
 
         if not entries:
             raise ValueError("retrieval needs at least one stored pattern")
 
         self.entries = entries
+
+        # LEARNED identity space (identity_net). If a trained adapter exists for
+        # this person, project every stored pattern AND the cue through it, so
+        # recall happens in the person's OWN geometry (test-AUC 0.90) instead of
+        # raw mpnet (0.51). Falls back to raw mpnet if untrained (safe floor:
+        # residual net starts near-identity, so it can only help). This is where
+        # the learned net actually MOVES the retrieval, not just a benchmark.
+        self._identity_net = None
+        if identity is not None:
+            try:
+                import identity_net
+                net, _rep = identity_net.load(identity)
+                self._identity_net = net
+            except Exception:
+                self._identity_net = None
         self.channel_w = channel_w  # channel-balance prior (report 732 must not
         # drown decision 45 by sheer COUNT; per-trace channel weight offsets it).
         self.alpha = alpha  # 1.5 = 1.5-entmax; ->1 recovers dense softmax
@@ -157,6 +173,11 @@ class HippocampalRetrieval:
             emb = encode_cached(texts, model_name=model_name, normalize=True)
         except Exception:
             emb = self.model.encode(texts, normalize_embeddings=True)
+        emb = np.asarray(emb, dtype=np.float32)
+        # project stored patterns into the learned identity space (if trained).
+        if self._identity_net is not None:
+            import identity_net
+            emb = identity_net.project(self._identity_net, emb)
         self.emb = torch.as_tensor(np.asarray(emb, dtype=np.float32))  # (N, d)
 
         # recency + salience + channel priors, normalized to [0,1] once at build.
@@ -321,6 +342,11 @@ class HippocampalRetrieval:
     # -- helpers ------------------------------------------------------------
     def _encode(self, text: str) -> torch.Tensor:
         v = self.model.encode([text], normalize_embeddings=True)[0]
+        v = np.asarray(v, dtype=np.float32)
+        # cue must live in the SAME space as the stored patterns.
+        if self._identity_net is not None:
+            import identity_net
+            v = identity_net.project(self._identity_net, v[None, :])[0]
         return torch.as_tensor(np.asarray(v, dtype=np.float32))
 
 

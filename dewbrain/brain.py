@@ -109,7 +109,7 @@ def _recall_context(cue: str, cfg: Config, log) -> list[dict]:
                 t.setdefault("salience", 0.0)
             _CONTEXT_RETR = HippocampalRetrieval(
                 pool, model_name=cfg.loop.embedding_model,
-                salience_w=0.15, recency_w=0.10)
+                salience_w=0.15, recency_w=0.10, identity="default")
         hits = _CONTEXT_RETR.recall(cue, k=cfg.loop.k)
         log("[hippocampus] recalled CONTEXT (what Damla did near this cue):")
         for h in hits:
