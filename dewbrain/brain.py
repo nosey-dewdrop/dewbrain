@@ -29,6 +29,8 @@ from law import YASA_METNI, RUBRIK, WEIGHTS
 from corpus import load_gold
 from retrieval import HippocampalRetrieval
 from engine import build_engine, Engine, EngineError
+from metacognition import assess as mc_assess, confidence_line
+from router import route
 
 # Backward-compat alias so old references keep working. The robust API/session backends
 # now live in engine.py; brain.py is engine-agnostic and only calls engine.complete().
@@ -73,14 +75,70 @@ def _few_shot(gold_hits: list[dict]) -> str:
     )
 
 
-def generate(cue: str, gold_hits: list[dict], engine: Engine, log) -> str:
-    """neocortex + vmPFC: produce a full post from the cue, conditioned on law + retrieved gold."""
+# Episodic retrieval is expensive to build (embeds the whole trail ~1200 traces).
+# Build it once per process, reuse across run() calls.
+_CONTEXT_RETR = None
+_CONTEXT_POOL_SIZE = 0
+
+
+def _recall_context(cue: str, cfg: Config, log) -> list[dict]:
+    """Recall relevant PAST traces (decisions/reports/writing/project maps) for
+    this cue from the full episodic trail. This is memory-of-experience, not
+    voice: it grounds generation in what Damla actually did near this topic.
+    Fails soft — if the pool can't load, the loop still runs on gold alone."""
+    global _CONTEXT_RETR, _CONTEXT_POOL_SIZE
+    try:
+        import sources
+        if _CONTEXT_RETR is None:
+            pool = sources.load_all()
+            _CONTEXT_POOL_SIZE = len(pool)
+            if not pool:
+                return []
+            log(f"[hippocampus] building episodic context retrieval over "
+                f"{len(pool)} traces (all channels)...")
+            # salience carries channel_weight so decisions outrank report lines.
+            for t in pool:
+                t.setdefault("salience", 0.0)
+            _CONTEXT_RETR = HippocampalRetrieval(
+                pool, model_name=cfg.loop.embedding_model,
+                salience_w=0.15, recency_w=0.10)
+        hits = _CONTEXT_RETR.recall(cue, k=cfg.loop.k)
+        log("[hippocampus] recalled CONTEXT (what Damla did near this cue):")
+        for h in hits:
+            log(f"  [{h.get('channel','?'):10}] score={h['score']:.3f}  {h['title'][:48]}")
+        return hits
+    except Exception as e:
+        log(f"[hippocampus] context recall unavailable ({e}); running on gold only.")
+        return []
+
+
+def _context_block(context_hits: list[dict]) -> str:
+    """Recalled episodic traces -> a grounding block. This is Damla's MEMORY of
+    what she did/decided near this topic, not her voice. It grounds the output
+    in real past instead of inventing (the law's 'no fabricated live feature')."""
+    if not context_hits:
+        return ""
+    blocks = []
+    for h in context_hits:
+        ch = h.get("channel", "")
+        blocks.append(f"[{ch}] {h['title']}\n{h['body']}")
+    joined = "\n\n".join(blocks)
+    return (
+        "\n\nDamla'nın bu konuya yakın GEÇMİŞİ (ne yaptı, ne karar verdi, ne "
+        "ölçtü). Uydurma; tez varsa buradaki gerçeğe dayandır:\n" + joined
+    )
+
+
+def generate(cue: str, gold_hits: list[dict], engine: Engine, log,
+             context_hits: list[dict] | None = None) -> str:
+    """neocortex + vmPFC: produce a full post from the cue, conditioned on law,
+    retrieved gold (voice) AND recalled episodic context (what Damla did)."""
     prompt = f"""{YASA_METNI}
 
 Aşağıda Damla'nın KENDİ onayladığı yazılarından örnekler var. Kelime seçimini, ritmini,
 cümle dokusunu, düşünce yapısını bunlardan öğren. TAKLİT etme, Damla gibi DÜŞÜN ve YAZ.
 
-{_few_shot(gold_hits)}
+{_few_shot(gold_hits)}{_context_block(context_hits or [])}
 
 --- GÖREV ---
 Damla'nın şu ham fikrini, yukarıdaki sesle TAM bir yazıya çevir. Yasaya birebir uy.
@@ -197,26 +255,43 @@ def run(cue: str, cfg: Config | None = None, verbose: bool = True) -> dict[str, 
     engine = build_engine(cfg)
     log(f"[engine] backend={cfg.api.engine} model={cfg.api.model}")
 
-    # hippocampus: recall the most separable gold traces (Hopfield/attention, not cosine-top-k).
+    # hippocampus: TWO retrieval layers with distinct roles (brain-architecture.md).
+    #   gold (verified voice) -> few-shot VOICE anchor: how Damla writes.
+    #   episodic pool (all channels: writing/decision/report/projectdoc/idea)
+    #     -> CONTEXT recall: what Damla did/decided/analysed near this cue. This
+    #        is what makes it a brain, not a typewriter — it remembers her past,
+    #        not just her style. World-model (Faz 2) rolls these forward.
     gold = load_gold()
     if not gold:
         raise DewbrainAPIError("No gold found (verified corpus empty) — cannot condition voice.")
     beta_src = "config" if cfg.loop.beta is not None else "calibrated-from-corpus"
-    log(f"[hippocampus] {len(gold)} gold loaded, building retrieval (beta={beta_src})...")
-    # beta=None => HippocampalRetrieval calibrates from corpus geometry (the point
-    # of calibrate_beta). Passing a hard 8.0 here would silently kill that.
+    log(f"[hippocampus] {len(gold)} gold loaded, building voice retrieval (beta={beta_src})...")
     retr = HippocampalRetrieval(gold, model_name=cfg.loop.embedding_model, beta=cfg.loop.beta)
     hits = retr.recall(cue, k=cfg.loop.k)
     sep = retr.separability
     log(f"[hippocampus] beta={retr.beta:.2f} separability mean_top_mass={sep['mean_top_mass']:.2f} "
         f"({len(sep.get('collisions', []))} colliding golds — blend risk while corpus is small)")
-    log("[hippocampus] retrieved gold (score = relevance + recency + salience, MMR-diverse):")
+    log("[hippocampus] recalled VOICE gold (few-shot anchor):")
     for h in hits:
         log(f"  score={h['score']:.3f} w={h['weight']:.3f} sim={h['sim']:.3f}  {h['title'][:50]}")
 
-    # neocortex + vmPFC: first draft.
+    # episodic context recall over the full trail (optional; degrades gracefully).
+    context_hits = _recall_context(cue, cfg, log)
+
+    # dual-process router (System 1/2): pick effort matched to THIS cue before
+    # spending any generation tokens. Familiar+low-stakes -> fast path (few
+    # rounds); novel or high-stakes (a decision, an idea) -> slow path (more
+    # critique, wider context, higher abstain floor). Orchestration, not a fixed
+    # pipeline — Damla's 'router -> orchestrator'. The cue's kind is inferred from
+    # the nearest recalled trace's channel (what it most resembles).
+    cue_channel = context_hits[0].get("channel", "") if context_hits else ""
+    rte = route(cue_channel, hits, context_hits,
+                base_max_iter=cfg.loop.max_iter, base_k=cfg.loop.k)
+    log(f"[router] {rte.path.upper()} — {rte.reason} (max_iter={rte.max_iter}, k={rte.k})")
+
+    # neocortex + vmPFC: first draft, grounded in voice (gold) + context (episodic).
     log("[neocortex+vmPFC] generating first draft...")
-    draft = generate(cue, hits, engine, log)
+    draft = generate(cue, hits, engine, log, context_hits=context_hits)
 
     # prefrontal: loop-until-clean. Re-critique after every repair; keep the best draft by
     # WEIGHTED violation (RUBRIC-ARROW), not raw count — a single em-dash beats two light fails.
@@ -227,9 +302,9 @@ def run(cue: str, cfg: Config | None = None, verbose: bool = True) -> dict[str, 
     iterations = 0
 
     current = draft
-    for i in range(cfg.loop.max_iter):
+    for i in range(rte.max_iter):
         iterations = i + 1
-        log(f"[prefrontal] critique pass {iterations}/{cfg.loop.max_iter}...")
+        log(f"[prefrontal] critique pass {iterations}/{rte.max_iter}...")
         verdict = critique(current, hits, engine, log)
         fails = _fail_count(verdict)
         wfail = _weighted_fail(verdict)
@@ -241,7 +316,7 @@ def run(cue: str, cfg: Config | None = None, verbose: bool = True) -> dict[str, 
         if fails == 0:
             log("[prefrontal] clean — loop done.")
             break
-        if iterations >= cfg.loop.max_iter:
+        if iterations >= rte.max_iter:
             log("[prefrontal] max_iter reached — keeping best draft.")
             break
 
@@ -249,19 +324,40 @@ def run(cue: str, cfg: Config | None = None, verbose: bool = True) -> dict[str, 
         current = repair(current, verdict, hits, engine, log)
 
     accepted = best_fails == 0
+
+    # metacognition: the brain states its OWN certainty and may ABSTAIN. This is
+    # Damla's sharpest law (prove, don't claim) — never assert "this is you" with
+    # no error bar. accepted (zero-violation) is necessary but NOT sufficient to
+    # claim identity; confidence fuses voice-fit, grounding and effort on top.
+    conf = mc_assess(
+        best_verdict or {},
+        gold_hits=hits,
+        context_hits=context_hits,
+        iterations=iterations,
+        max_iter=rte.max_iter,
+        weights=WEIGHTS,
+        abstain_floor=rte.abstain_floor,
+        sure_bar=rte.sure_bar,
+    )
+    log(f"[metacognition] {confidence_line(conf)}")
+
     result = {
         "cue": cue,
         "gold_used": [h["title"] for h in hits],
+        "context_used": [h["title"] for h in context_hits],
         "final": best_draft,
         "verdict": best_verdict,
         "ihlal_sayisi": best_fails,
         "weighted_fail": best_weight,
         "iterations": iterations,
         "accepted": accepted,
+        "confidence": conf.as_dict(),
+        "abstained": conf.abstains,
     }
 
     hist = persist_run(result, cfg)
-    log(f"[flywheel] run saved -> {hist} (accepted={accepted})")
+    log(f"[flywheel] run saved -> {hist} (accepted={accepted}, "
+        f"confidence={conf.verdict} {conf.score:.0%})")
     result["history_path"] = str(hist)
     return result
 
