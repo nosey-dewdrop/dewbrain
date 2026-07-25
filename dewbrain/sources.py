@@ -169,6 +169,40 @@ def _load_ideas() -> list[dict]:
                                     channel="idea", min_chars=20)
 
 
+# Desktop holds Damla's real idea/thesis/note material (video-fikirleri = how she
+# thinks, content-creator gece-* = her writing, damla.md = who she is). It is NOT
+# under damla_projects_2026, so the registry pulls it explicitly. WHITELIST only:
+# code homework (LeetCode, CS102), assets, and raw chat logs are not her voice.
+DESKTOP = Path.home() / "Desktop"
+_DESKTOP_INCLUDE = [
+    "video-fikirleri",        # idea/thesis material (Pink Floyd->loneliness, Zimbardo->power)
+    "content-creator-agent/gece-yazilar.md",
+    "content-creator-agent/gece-linkedin.md",
+    "content-creator-agent/gece-reels.md",
+    # damla.md + damumya/ DELIBERATELY EXCLUDED: those are raw, un-curated personal
+    # notes. Damla's publishable self already lives, curated, in the content system
+    # (dewrites/dewlog/dewthinks/dewideo). The brain learns her voice from the
+    # curated channel, not from raw private notes (her call, 25 Tem).
+]
+
+
+def _load_desktop() -> list[dict]:
+    """Damla's Desktop idea/note material (whitelisted paths only)."""
+    out: list[dict] = []
+    for rel in _DESKTOP_INCLUDE:
+        p = DESKTOP / rel
+        if p.is_dir():
+            for f in sorted(p.rglob("*.md")):
+                if _excluded(f):
+                    continue
+                out.extend(_split_markdown_sections(f, source=f"desktop:{f.stem}",
+                                                    channel="desktop", min_chars=30))
+        elif p.is_file():
+            out.extend(_split_markdown_sections(p, source=f"desktop:{p.stem}",
+                                                channel="desktop", min_chars=30))
+    return out
+
+
 def _load_notes_from(root_env: str) -> Callable[[], list[dict]]:
     """Factory: a notes/Obsidian loader over a directory given by env/arg.
     Not wired by default — Damla points it at her vault when she wants it in."""
@@ -216,6 +250,8 @@ REGISTRY: list[Channel] = [
             note="every CLAUDE.md — project map, what+status+ideas"),
     Channel("idea", _load_ideas, weight=1.1,
             note="IDEA_PARKING — what-to-build instinct"),
+    Channel("desktop", _load_desktop, weight=1.2,
+            note="Desktop idea/thesis/notes — how Damla thinks (video-fikirleri, gece-*, damla.md)"),
     # Parked until Damla points it at her vault (DEWBRAIN_NOTES_DIR / Obsidian).
     Channel("notes", _load_notes_from("DEWBRAIN_NOTES_DIR"), weight=1.0,
             enabled=False, note="personal notes / Obsidian — set DEWBRAIN_NOTES_DIR"),
